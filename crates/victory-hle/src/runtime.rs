@@ -224,3 +224,10 @@ mod tests {
         assert_eq!(Title::from_manifest("").storage_bytes, 0);
     }
 }
+
+
+/// Persist graphics cache metadata after normal title termination.
+#[cfg(windows)]
+pub fn flush_graphics_cache() {
+    victory_gpu::pipeline::save_pipeline_cache();
+}

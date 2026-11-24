@@ -121,6 +121,7 @@ pub fn run(
     let code = main
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
+    victory_hle::runtime::flush_graphics_cache();
     println!("title exited with {code}");
     Ok(())
 }

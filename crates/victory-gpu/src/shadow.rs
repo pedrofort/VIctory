@@ -65,14 +65,38 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
-/// Returns a snapshot buffer to the pool (at most 8 kept, the largest).
-fn give_back(v: Vec<u8>) {
+/// Bound retained snapshot memory, not live allocations.
+/// Large snapshots still work; they simply are not pooled.
+const SNAPSHOT_POOL_BYTES: usize = 128 * 1024 * 1024;
+const SNAPSHOT_MAX_BUFFER: usize = 64 * 1024 * 1024;
+
+fn give_back(mut v: Vec<u8>) {
+    if v.capacity() > SNAPSHOT_MAX_BUFFER {
+        return;
+    }
+
+    v.clear();
+
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
-    if pool.len() > 8 {
-        pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-        pool.truncate(8);
-    }
+
+    // Prefer retaining buffers most likely to be useful
+    // for the next large snapshot, within the byte budget.
+    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+    pool.truncate(8);
+
+    let mut retained = 0usize;
+
+    pool.retain(|v| {
+        let next = retained.saturating_add(v.capacity());
+
+        if next > SNAPSHOT_POOL_BYTES {
+            false
+        } else {
+            retained = next;
+            true
+        }
+    });
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -496,4 +520,91 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+
+#[cfg(test)]
+mod systems_max_pool {
+    use super::*;
+
+    #[test]
+    fn snapshot_retention_ab() {
+        const MIB: usize = 1024 * 1024;
+
+        POOL.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+
+        let start = std::time::Instant::now();
+
+        // Simulate several simultaneously live snapshots.
+        // Touch every byte, then return them to the pool.
+        let mut buffers = Vec::new();
+
+        for i in 0..8u8 {
+            let mut v = pooled(32 * MIB);
+            v.resize(32 * MIB, i);
+            assert_eq!(v[0], i);
+            assert_eq!(v[v.len()-1], i);
+            buffers.push(v);
+        }
+
+        let mut oversized = pooled(96 * MIB);
+        oversized.resize(96 * MIB, 0x5a);
+
+        assert_eq!(oversized[0], 0x5a);
+        assert_eq!(oversized[oversized.len()-1], 0x5a);
+
+        for v in buffers {
+            give_back(v);
+        }
+
+        give_back(oversized);
+
+        let (count, retained) = {
+            let p = POOL.lock()
+                .unwrap_or_else(|e| e.into_inner());
+
+            (
+                p.len(),
+                p.iter().map(|v| v.capacity()).sum::<usize>()
+            )
+        };
+
+        println!("SYSTEMS_POOL_COUNT={count}");
+        println!("SYSTEMS_POOL_BYTES={retained}");
+
+        // Reuse with varying lengths. Check that stale
+        // snapshot bytes are never exposed through Vec length.
+        let mut verified = 0usize;
+
+        for i in 0..64usize {
+            let n = (1 + i % 8) * MIB;
+            let value = (i as u8) ^ 0x9d;
+
+            let mut v = pooled(n);
+
+            assert!(v.is_empty());
+            assert!(v.capacity() >= n);
+
+            v.resize(n, value);
+
+            for at in [0, n/2, n-1] {
+                assert_eq!(v[at], value);
+                verified += 1;
+            }
+
+            give_back(v);
+        }
+
+        println!("SYSTEMS_POOL_CONTROLS={verified}/192");
+        println!(
+            "SYSTEMS_POOL_ELAPSED_MS={}",
+            start.elapsed().as_millis()
+        );
+
+        POOL.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
 }

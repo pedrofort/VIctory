@@ -139,7 +139,61 @@ pub(crate) fn pipeline(
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let Some(dir) = DIR.get() else { return };
+
+    let Some(library) = library() else {
+        // A driver can reject the pipeline library while
+        // direct PSO creation remains fully functional.
+        // Preserve the independent early-pipeline list.
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+
+        if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+            return;
+        }
+
+        let mut keys: Vec<String> = {
+            let used = USED.lock().unwrap_or_else(|e| e.into_inner());
+
+            if !USED_CHANGED.swap(false, Ordering::Relaxed) {
+                return;
+            }
+
+            used.iter().flatten().cloned().collect()
+        };
+
+        keys.sort_unstable();
+
+        let result = std::fs::create_dir_all(dir)
+            .and_then(|()| write_atomically(
+                &dir.join(EARLY_FILE),
+                keys.join("\n").as_bytes()
+            ));
+
+        match result {
+            Ok(()) => {
+                *last = Some(std::time::Instant::now());
+
+                tracing::info!(
+                    early = keys.len(),
+                    made = MADE.load(Ordering::Relaxed),
+                    started_early = EARLY.load(Ordering::Relaxed),
+                    "SYSTEMS_EARLY_CACHE_SAVED"
+                );
+            }
+            Err(e) => {
+                // Retry on a subsequent save. Do not lose
+                // the dirty state when storage is unavailable.
+                USED_CHANGED.store(true, Ordering::Relaxed);
+
+                tracing::warn!(
+                    error = %e,
+                    "SYSTEMS_EARLY_CACHE_SAVE_FAILED"
+                );
+            }
+        }
+
+        return;
+    };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
@@ -218,6 +272,7 @@ pub(crate) fn wanted_early(key: &str) -> bool {
 
 /// The title pipeline with `key` was drawn or dispatched with.
 pub(crate) fn note_used(key: &str) {
+    tracing::debug!(key = %key, "SYSTEMS_PIPELINE_USED");
     let mut used = used();
     let set = used.get_or_insert_with(HashSet::new);
     if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
