@@ -802,6 +802,7 @@ impl Host {
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
+            list.ClearRenderTargetView(rtv, &[0.0; 4], None);
             list.RSSetViewports(&[D3D12_VIEWPORT {
                 Width: w as f32,
                 Height: h as f32,
@@ -870,17 +871,34 @@ impl Host {
             queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
             let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
             queue.Signal(&fence, 1).map_err(err)?;
-            while fence.GetCompletedValue() < 1 {
-                if dev.GetDeviceRemovedReason().is_err() {
-                    return Err(format!(
-                        "device removed: {}",
-                        err(dev.GetDeviceRemovedReason().unwrap_err())
-                    ));
+
+            let started = std::time::Instant::now();
+
+            loop {
+                let completed = fence.GetCompletedValue();
+
+                if completed == u64::MAX
+                    || dev.GetDeviceRemovedReason().is_err()
+                {
+                    eprintln!("MESH_DEVICE_REMOVED");
+                    std::process::abort();
                 }
-                std::thread::yield_now();
-            }
-            if let Err(e) = dev.GetDeviceRemovedReason() {
-                return Err(format!("device removed: {}", err(e)));
+
+                if completed >= 1 {
+                    eprintln!("MESH_GPU_FENCE={}", completed);
+                    break;
+                }
+
+                if started.elapsed()
+                    > std::time::Duration::from_secs(15)
+                {
+                    eprintln!("MESH_GPU_TIMEOUT");
+                    std::process::abort();
+                }
+
+                std::thread::sleep(
+                    std::time::Duration::from_millis(1)
+                );
             }
             let mut p = std::ptr::null_mut();
             readback.Map(0, None, Some(&mut p)).map_err(err)?;
@@ -1416,5 +1434,344 @@ impl Host {
             drop(keep);
             Ok(out)
         }
+    }
+}
+
+
+#[cfg(all(test, windows))]
+mod graphics_max_mesh {
+    use super::*;
+
+    #[test]
+    #[ignore = "explicit mesh hardware probe"]
+    fn mesh_pixels() {
+        let host = Host::new(false)
+            .expect("real SM 6.6 device");
+
+        let path = std::path::PathBuf::from(
+            std::env::var_os("GRAPHICS_MAX_SHADERS")
+                .expect("shader path")
+        );
+
+        let groups: u32 =
+            std::env::var("GRAPHICS_MAX_GROUPS")
+                .unwrap().parse().unwrap();
+
+        assert!(groups <= 2);
+
+        let mut validator =
+            crate::emit::validator::Validator::load(
+                crate::emit::validator::Validator::default_path()
+                    .as_deref()
+            ).expect("DXIL validator");
+
+        let mut read = |name: &str| {
+            let mut data = std::fs::read(
+                path.join(format!("{name}.dxil"))
+            ).unwrap();
+
+            validator.validate(&mut data)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+
+            eprintln!("DXIL_VALIDATED={name}");
+
+            data
+        };
+
+        let ps = read("ps");
+
+        let root = host.root_signature_of(&[], &[])
+            .expect("root signature");
+
+        eprintln!("ROOT_SIGNATURE_OK");
+
+        let pso = if groups == 0 {
+            let vs = read("vs");
+
+            host.pipeline_with(&root,&vs,&ps)
+                .expect("vertex pipeline")
+        } else {
+            let ms = read("ms");
+
+            host.mesh_pipeline_with(&root,&ms,&ps)
+                .expect("mesh pipeline")
+        };
+
+        eprintln!("PSO_OK groups={groups}");
+
+        let a = [0.25f32,0.5,0.75,1.0];
+        let b = [0.75f32,0.25,0.5,1.0];
+
+        let mut total = 0usize;
+
+        for (w,h) in [(16u32,16u32),(32,24)] {
+            let pixels = host.draw(
+                &root,
+                &pso,
+                &Draw {
+                    roots: vec![],
+                    textures: &[],
+                    samplers: &[],
+                    vertices: &[],
+                    stride: 0,
+                    size: (w,h),
+                    mesh_groups: groups
+                }
+            ).expect("draw and readback");
+
+            assert_eq!(pixels.len(),(w*h) as usize);
+
+            let mut mismatches = 0usize;
+
+            let mut max_error = 0.0f32;
+
+            for (i,p) in pixels.iter().enumerate() {
+                let x = i as u32 % w;
+
+                let expected = if groups == 0 || x < w/2 {
+                    a
+                } else if groups == 2 {
+                    b
+                } else {
+                    [0.0;4]
+                };
+
+                assert!(p.iter().all(|v| v.is_finite()));
+
+                if *p != expected {
+                    mismatches += 1;
+
+                    if mismatches <= 8 {
+                        eprintln!(
+                            "PIXEL_MISMATCH i={i} actual={p:?} expected={expected:?}"
+                        );
+                    }
+                }
+
+                for c in 0..4 {
+                    max_error = max_error.max(
+                        (p[c]-expected[c]).abs()
+                    );
+                }
+            }
+
+            eprintln!(
+                "PIXEL_RESULT {}x{} groups={} pixels={} mismatches={} max_error={}",
+                w,h,groups,pixels.len(),mismatches,max_error
+            );
+
+            assert_eq!(mismatches,0);
+
+            total += pixels.len();
+        }
+
+        assert_eq!(total,1024);
+
+        eprintln!(
+            "MESH_CASE_PASS groups={} pixels={}",
+            groups,total
+        );
+    }
+}
+
+
+#[cfg(all(test, windows))]
+mod graphics_max_rdna2_mesh {
+    use super::*;
+
+    #[test]
+    #[ignore = "explicit RDNA2 mesh translation experiment"]
+    fn translated_mesh() {
+        use crate::native::{NativeProgram, StageIo, MeshIo};
+
+        let host = Host::new(false)
+            .expect("real SM 6.6 device");
+
+        let dir = std::path::PathBuf::from(
+            std::env::var_os("GRAPHICS_MAX_SHADERS")
+                .expect("shader directory")
+        );
+
+        let mode = std::env::var("GRAPHICS_MAX_MESH_CASE")
+            .expect("experiment case");
+
+        let mut validator =
+            crate::emit::validator::Validator::load(
+                crate::emit::validator::Validator::default_path()
+                    .as_deref()
+            ).expect("DXIL validator");
+
+        let mut reference =
+            std::fs::read(dir.join("reference-ms.dxil")).unwrap();
+
+        let mut ps =
+            std::fs::read(dir.join("reference-ps.dxil")).unwrap();
+
+        validator.validate(&mut reference)
+            .expect("reference mesh validation");
+
+        validator.validate(&mut ps)
+            .expect("reference pixel validation");
+
+        let ms = if mode == "reference" {
+            reference.clone()
+        } else {
+            assert!(matches!(mode.as_str(),"triangle" | "culled"));
+
+            let code =
+                std::fs::read(dir.join(format!("{mode}.bin")))
+                    .unwrap();
+
+            let native = NativeProgram {
+                stage: crate::HwStage::Ms,
+                wave64: true,
+                vgprs: 16,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ms(MeshIo {
+                    outputs: vec![],
+                    clip_cntl: 0,
+                    threads: 64,
+                    max_vertices: 64,
+                    max_primitives: 64,
+                    topology: 2,
+                    lds_bytes: 0
+                }),
+                code,
+            };
+
+            let p = crate::ir::build(
+                &native.patched_code(),
+                native.wave64,
+                native.vgprs
+            ).expect("RDNA2 decode and IR");
+
+            eprintln!(
+                "RDNA2_IR_OK blocks={}",
+                p.blocks.len()
+            );
+
+            let io = crate::io::raise(&p,&native)
+                .expect("RDNA2 IO");
+
+            eprintln!("RDNA2_IO_OK");
+
+            let resources = crate::resource::track(
+                &p,&native.layout,native.stage
+            ).expect("resource analysis");
+
+            let structured = crate::structure::structure(&p)
+                .expect("structured control flow");
+
+            eprintln!("RDNA2_STRUCTURE_OK");
+
+            let signature = crate::dxbc::Container::parse(
+                &reference
+            ).expect("synthetic signature container");
+
+            let emitted = crate::emit::emit(
+                &signature,
+                &native,
+                &p,
+                &structured,
+                &io,
+                &resources
+            ).expect("RDNA2 to DXIL emission");
+
+            assert_eq!(emitted.stage,crate::HwStage::Ms);
+
+            eprintln!(
+                "RDNA2_EMIT_OK bytes={}",
+                emitted.dxil.len()
+            );
+
+            let mut dxil = emitted.dxil;
+
+            std::fs::write(
+                dir.join(format!("{mode}-translated.dxil")),
+                &dxil
+            ).unwrap();
+
+            let original = dxil.clone();
+
+            validator.validate(&mut dxil)
+                .expect("translated DXIL validation");
+
+            eprintln!(
+                "RDNA2_VALIDATED unchanged={}",
+                original == dxil
+            );
+
+            std::fs::write(
+                dir.join(format!("{mode}-validated.dxil")),
+                &dxil
+            ).unwrap();
+
+            dxil
+        };
+
+        let root = host.root_signature_of(&[],&[])
+            .expect("mesh root signature");
+
+        let pso = host.mesh_pipeline_with(&root,&ms,&ps)
+            .expect("mesh pipeline");
+
+        eprintln!("RDNA2_MESH_PSO_OK mode={mode}");
+
+        let expected = if mode == "culled" {
+            [0.0f32;4]
+        } else {
+            [0.25f32,0.5,0.75,1.0]
+        };
+
+        let mut total = 0usize;
+
+        for (w,h) in [(16u32,16u32),(32,24)] {
+            let pixels = host.draw(
+                &root,&pso,
+                &Draw {
+                    roots: vec![],
+                    textures: &[],
+                    samplers: &[],
+                    vertices: &[],
+                    stride: 0,
+                    size: (w,h),
+                    mesh_groups: 1
+                }
+            ).expect("mesh execution and readback");
+
+            assert_eq!(pixels.len(),(w*h) as usize);
+
+            let mut mismatches = 0usize;
+
+            for (i,actual) in pixels.iter().enumerate() {
+                assert!(actual.iter().all(|v| v.is_finite()));
+
+                if *actual != expected {
+                    mismatches += 1;
+
+                    if mismatches <= 8 {
+                        eprintln!(
+                            "MISMATCH {i} actual={actual:?} expected={expected:?}"
+                        );
+                    }
+                }
+            }
+
+            eprintln!(
+                "RDNA2_PIXELS mode={mode} size={}x{} pixels={} mismatches={}",
+                w,h,pixels.len(),mismatches
+            );
+
+            assert_eq!(mismatches,0);
+
+            total += pixels.len();
+        }
+
+        assert_eq!(total,1024);
+
+        eprintln!(
+            "RDNA2_MESH_PASS mode={mode} pixels={total}"
+        );
     }
 }

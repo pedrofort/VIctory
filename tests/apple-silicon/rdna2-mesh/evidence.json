@@ -1,0 +1,44 @@
+{
+  "environment": {
+    "hardware": "Apple M5",
+    "memory_gib": 16,
+    "host": "Wine/Rosetta/D3DMetal"
+  },
+  "cases": [
+    {
+      "mode": "reference",
+      "passed": true,
+      "pixels": 1024
+    },
+    {
+      "mode": "triangle",
+      "passed": true,
+      "pixels": 1024
+    },
+    {
+      "mode": "culled",
+      "passed": true,
+      "pixels": 1024
+    }
+  ],
+  "translated_pixels": 2048,
+  "reference_pixels": 1024,
+  "shader_hashes": {
+    "culled-translated.dxil": "ec6d3e1a16b05fafce94d5078fd9e3e5defb2f131521bb49fac42ffcfc7fda1c",
+    "culled-validated.dxil": "ec6d3e1a16b05fafce94d5078fd9e3e5defb2f131521bb49fac42ffcfc7fda1c",
+    "culled.bin": "ba7a4015dbbcab9d6389320a9a841d5948dc7e5c082993e7fb378df6401b2cd1",
+    "culled.o": "64894265c4a0ee9e89c513b3a4a3c8a3cc5e882682b841353392d6c520d9c57f",
+    "culled.s": "aca94df3f08e1fc941e7d2660ac2f2b9dc5032fc49fb1381b9225fcbd1902a23",
+    "reference-ms.dxil": "6f29a72eadc03acc8271c98d6a57bc4fafdf5c7923cd1d88977528cb8cf5abb9",
+    "reference-ps.dxil": "b041bb9fd42ea879479dbef5b3162552b9e68f281373d645f27fc1ae72f00312",
+    "reference.hlsl": "fa675ad79a44cc9e30253d07b0e698326f6bd01b541151f52ba8c6631a311716",
+    "triangle-translated.dxil": "9f0f045f0ac6d7c977be0a3ea5bc3c50fa514f4b69670dc3fc24a108cbd6f7d1",
+    "triangle-validated.dxil": "9f0f045f0ac6d7c977be0a3ea5bc3c50fa514f4b69670dc3fc24a108cbd6f7d1",
+    "triangle.bin": "6411b44417b743afa1aa1fb22c6f13c9bfe61646fa507fc0a047a6c6d66e714a",
+    "triangle.o": "52b7fdc384ffb5c39ae22e558f818ad224c7079e0a8d4d031c98d5b71e7ea207",
+    "triangle.s": "ecb998331690d41b95483a41ced8a566b11a46daf64e2c2ad707db78b95081c5"
+  },
+  "complete_xbox_container_tested": false,
+  "console_compiler_used": false,
+  "commercial_assets_used": false
+}

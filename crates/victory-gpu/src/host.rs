@@ -2200,3 +2200,383 @@ mod apple_deep_audit {
         }
     }
 }
+
+
+#[cfg(all(test, windows))]
+mod graphics_max_formats {
+    use super::*;
+    use windows::Win32::System::Threading::{
+        CreateEventW, WaitForSingleObject
+    };
+    use windows::core::Interface;
+
+    #[test]
+    #[ignore = "explicit GRAPHICS-MAX hardware experiment"]
+    fn format_roundtrip() {
+        let name = std::env::var("GRAPHICS_MAX_FORMAT")
+            .expect("select one format");
+
+        let (format, w, h, block_w, block_h, block_bytes) =
+            match name.as_str() {
+                "RGBA8" =>
+                    (DXGI_FORMAT_R8G8B8A8_UNORM, 13, 9, 1, 1, 4),
+                "BGRA8" =>
+                    (DXGI_FORMAT_B8G8R8A8_UNORM, 13, 9, 1, 1, 4),
+                "RGBA16F" =>
+                    (DXGI_FORMAT_R16G16B16A16_FLOAT, 13, 9, 1, 1, 8),
+                "BC1" =>
+                    (DXGI_FORMAT_BC1_UNORM, 12, 8, 4, 4, 8),
+                "BC3" =>
+                    (DXGI_FORMAT_BC3_UNORM, 12, 8, 4, 4, 16),
+                "BC5" =>
+                    (DXGI_FORMAT_BC5_UNORM, 12, 8, 4, 4, 16),
+                "BC7" =>
+                    (DXGI_FORMAT_BC7_UNORM, 12, 8, 4, 4, 16),
+                "D32" =>
+                    (DXGI_FORMAT_D32_FLOAT, 13, 9, 1, 1, 4),
+                _ => panic!("unknown format"),
+            };
+
+        let (w, h, block_w, block_h, block_bytes):
+            (u32, u32, u32, u32, u32) =
+            (w, h, block_w, block_h, block_bytes);
+
+        let host = super::host()
+            .expect("GRAPHICS-MAX requires a real GPU");
+
+        let dev = &host.device;
+
+        let expected_rows = h.div_ceil(block_h);
+
+        let expected_row_bytes =
+            w.div_ceil(block_w) * block_bytes;
+
+        eprintln!(
+            "GRAPHICS_MAX START format={} dimensions={}x{} rows={} row_bytes={}",
+            name, w, h, expected_rows, expected_row_bytes
+        );
+
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: u64::from(w),
+            Height: h,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Flags: if name == "D32" {
+                D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
+            } else {
+                D3D12_RESOURCE_FLAG_NONE
+            },
+            ..Default::default()
+        };
+
+        unsafe {
+            let mut fp =
+                D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+
+            let mut rows = 0u32;
+            let mut row_bytes = 0u64;
+            let mut total = 0u64;
+
+            dev.GetCopyableFootprints(
+                &desc,
+                0,
+                1,
+                0,
+                Some(&mut fp),
+                Some(&mut rows),
+                Some(&mut row_bytes),
+                Some(&mut total),
+            );
+
+            assert_eq!(rows, expected_rows);
+            assert_eq!(row_bytes, u64::from(expected_row_bytes));
+            assert!(total > 0 && total < 1024 * 1024);
+
+            assert!(
+                u64::from(fp.Footprint.RowPitch) >= row_bytes
+            );
+
+            assert_eq!(fp.Footprint.RowPitch % 256, 0);
+
+            let capacity = total.next_multiple_of(512) + 512;
+
+            let make = |
+                heap_type: D3D12_HEAP_TYPE,
+                desc: &D3D12_RESOURCE_DESC,
+                state: D3D12_RESOURCE_STATES
+            | -> ID3D12Resource {
+                let mut out = None;
+
+                let heap = D3D12_HEAP_PROPERTIES {
+                    Type: heap_type,
+                    ..Default::default()
+                };
+
+                dev.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    desc,
+                    state,
+                    None,
+                    &mut out,
+                ).expect("CreateCommittedResource");
+
+                out.expect("resource")
+            };
+
+            let buffer_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: capacity,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+
+            let upload = make(
+                D3D12_HEAP_TYPE_UPLOAD,
+                &buffer_desc,
+                D3D12_RESOURCE_STATE_GENERIC_READ
+            );
+
+            let texture = make(
+                D3D12_HEAP_TYPE_DEFAULT,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST
+            );
+
+            let readback = make(
+                D3D12_HEAP_TYPE_READBACK,
+                &buffer_desc,
+                D3D12_RESOURCE_STATE_COPY_DEST
+            );
+
+            let pitch = fp.Footprint.RowPitch as usize;
+            let row_len = row_bytes as usize;
+
+            let mut expected = Vec::new();
+
+            for y in 0..rows as usize {
+                let mut row: Vec<u8> = (0..row_len)
+                    .map(|x| {
+                        ((x * 37 + y * 71 + 19) % 251) as u8
+                    })
+                    .collect();
+
+                if name == "D32" {
+                    for (i, word) in row.chunks_exact_mut(4).enumerate() {
+                        let v =
+                            ((i + y * 13 + 1) % 97) as f32 / 128.0;
+
+                        word.copy_from_slice(&v.to_le_bytes());
+                    }
+                }
+
+                if name == "RGBA16F" {
+                    for (i, word) in row.chunks_exact_mut(2).enumerate() {
+                        let v = 0x3000u16 +
+                            ((i * 53 + y * 17) % 1024) as u16;
+
+                        word.copy_from_slice(&v.to_le_bytes());
+                    }
+                }
+
+                if name == "BC7" {
+                    for block in row.chunks_exact_mut(16) {
+                        block[0] = 0x40;
+                    }
+                }
+
+                expected.push(row);
+            }
+
+            let mut ptr = std::ptr::null_mut();
+
+            upload.Map(0, None, Some(&mut ptr))
+                .expect("upload Map");
+
+            assert!(!ptr.is_null());
+
+            let mapped = std::slice::from_raw_parts_mut(
+                ptr.cast::<u8>(),
+                capacity as usize
+            );
+
+            mapped.fill(0xCD);
+
+            for (y, row) in expected.iter().enumerate() {
+                let at = fp.Offset as usize + y * pitch;
+
+                mapped[at..at + row_len]
+                    .copy_from_slice(row);
+            }
+
+            upload.Unmap(
+                0,
+                Some(&D3D12_RANGE {
+                    Begin: 0,
+                    End: capacity as usize
+                })
+            );
+
+            let queue: ID3D12CommandQueue =
+                dev.CreateCommandQueue(
+                    &D3D12_COMMAND_QUEUE_DESC {
+                        Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        ..Default::default()
+                    }
+                ).expect("queue");
+
+            let allocator: ID3D12CommandAllocator =
+                dev.CreateCommandAllocator(
+                    D3D12_COMMAND_LIST_TYPE_DIRECT
+                ).expect("allocator");
+
+            let list: ID3D12GraphicsCommandList =
+                dev.CreateCommandList(
+                    0,
+                    D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    &allocator,
+                    None
+                ).expect("command list");
+
+            let source = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&upload),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: fp
+                }
+            };
+
+            let image = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&texture),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: 0
+                }
+            };
+
+            let dest = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&readback),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: fp
+                }
+            };
+
+            list.CopyTextureRegion(
+                &image, 0, 0, 0, &source, None
+            );
+
+            list.ResourceBarrier(&[super::transition(
+                &texture,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_COPY_SOURCE
+            )]);
+
+            list.CopyTextureRegion(
+                &dest, 0, 0, 0, &image, None
+            );
+
+            list.Close().expect("Close command list");
+
+            let command: ID3D12CommandList =
+                list.cast().expect("command interface");
+
+            let fence: ID3D12Fence =
+                dev.CreateFence(
+                    0, D3D12_FENCE_FLAG_NONE
+                ).expect("fence");
+
+            let event = CreateEventW(
+                None, false, false, None
+            ).expect("event");
+
+            queue.ExecuteCommandLists(&[Some(command)]);
+
+            queue.Signal(&fence, 1).expect("Signal");
+
+            fence.SetEventOnCompletion(1, event)
+                .expect("SetEventOnCompletion");
+
+            let wait = WaitForSingleObject(event, 15000);
+
+            let _ = windows::Win32::Foundation::CloseHandle(event);
+
+            if wait.0 != 0 {
+                eprintln!(
+                    "GRAPHICS_MAX GPU_WAIT_FAILED status={:#x}",
+                    wait.0
+                );
+
+                std::process::abort();
+            }
+
+            let completed = fence.GetCompletedValue();
+
+            assert!(completed >= 1);
+            assert_ne!(completed, u64::MAX);
+
+            dev.GetDeviceRemovedReason()
+                .expect("device removed");
+
+            let mut ptr = std::ptr::null_mut();
+
+            readback.Map(
+                0,
+                Some(&D3D12_RANGE {
+                    Begin: 0,
+                    End: capacity as usize
+                }),
+                Some(&mut ptr)
+            ).expect("readback Map");
+
+            assert!(!ptr.is_null());
+
+            let read = std::slice::from_raw_parts(
+                ptr.cast::<u8>(),
+                capacity as usize
+            );
+
+            let mut compared = 0usize;
+
+            for (y, expected_row) in expected.iter().enumerate() {
+                let at = fp.Offset as usize + y * pitch;
+
+                assert_eq!(
+                    &read[at..at + row_len],
+                    expected_row.as_slice(),
+                    "{} row {}", name, y
+                );
+
+                compared += row_len;
+            }
+
+            readback.Unmap(
+                0,
+                Some(&D3D12_RANGE {
+                    Begin: 0,
+                    End: 0
+                })
+            );
+
+            assert!(compared > 0);
+
+            eprintln!(
+                "GRAPHICS_MAX FORMAT_PASS format={} bytes={} rows={} pitch={} fence={}",
+                name, compared, rows, pitch, completed
+            );
+        }
+    }
+}
