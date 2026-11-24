@@ -632,7 +632,11 @@ impl<'a> Lanes<'a> {
                 .filter(|(lo, hi)| lo != hi)
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
-            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
+            paired_masks: if self.p.wave64 {
+                self.masks
+            } else {
+                Map::default()
+            },
             active: self.active,
             bools: self.b,
             exits,
@@ -680,6 +684,36 @@ impl<'a> Lanes<'a> {
             None => {
                 let (lo, hi) = (self.defs.get(&k.0).copied(), self.defs.get(&k.1).copied());
                 let def = |d: Option<(usize, usize)>| d.map(|(b, i)| &p.blocks[b].insts[i]);
+
+                // A wave64 mask may be assembled by independent
+                // 32-bit scalar moves. Preserve both SSA values
+                // instead of reducing the pair to its low dword.
+                let immediate_word = |d: Option<(usize, usize)>| {
+                    let inst = def(d)?;
+
+                    if inst.name() != "s_mov_b32" {
+                        return None;
+                    }
+
+                    let Fields::Sop { src, .. } = &inst.fields else {
+                        return None;
+                    };
+
+                    match *src.first()? {
+                        Operand::Literal(v) => Some(v),
+                        Operand::Const(c) => crate::resource::inline(c),
+                        _ => None,
+                    }
+                };
+
+                let constant_pair = if p.wave64 && lo != hi {
+                    immediate_word(lo)
+                        .zip(immediate_word(hi))
+                        .map(|(low, high)| u64::from(low) | (u64::from(high) << 32))
+                } else {
+                    None
+                };
+
                 let m = match (lo, hi) {
                     (Some(at), Some(hi)) if at == hi => def(lo)
                         .and_then(|i| self.sop(i))
@@ -694,10 +728,18 @@ impl<'a> Lanes<'a> {
                     })
                 };
                 let derived = exec_write(lo, k.0) || exec_write(hi, k.1);
-                let m = m.unwrap_or_else(|| {
-                    let born = self.born(k.0);
-                    self.b.atom(Atom::Opaque(k.0), born)
-                });
+                let m = if let Some(bits) = constant_pair {
+                    match bits {
+                        0 => Bool::FALSE,
+                        u64::MAX => Bool::TRUE,
+                        _ => self.b.atom(Atom::Constant(bits), 0),
+                    }
+                } else {
+                    m.unwrap_or_else(|| {
+                        let born = self.born(k.0);
+                        self.b.atom(Atom::Opaque(k.0), born)
+                    })
+                };
                 (m, derived)
             }
         };
@@ -1230,5 +1272,155 @@ mod tests {
         assert_eq!(p.blocks[0].exit.successors(), [2, 4]);
         assert_eq!(p.blocks[1].preds, [2]);
         assert!(structure(&p).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod split_exec_regressions {
+    use super::*;
+
+    fn evaluate(bools: &Bools, b: Bool, lane: u32) -> bool {
+        match b {
+            Bool::TRUE => true,
+            Bool::FALSE => false,
+            _ => {
+                let (atom, lo, hi) = bools.node(b).expect("BDD node");
+
+                let bit = match atom {
+                    Atom::Constant(bits) => ((bits >> lane) & 1) != 0,
+                    other => panic!("constant EXEC mask not recovered: {other:?}"),
+                };
+
+                evaluate(bools, if bit { hi } else { lo }, lane)
+            }
+        }
+    }
+
+    fn check_mask(words: &[u32], expected: u64) {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+
+        let p = crate::ir::build(&code, true, 256).unwrap();
+        let st = structure(&p).unwrap();
+
+        let mut moves = Vec::new();
+
+        for (b, block) in p.blocks.iter().enumerate() {
+            for (i, inst) in block.insts.iter().enumerate() {
+                if inst.name().starts_with("v_mov_b32") {
+                    moves.push((b, i));
+                }
+            }
+        }
+
+        assert_eq!(moves.len(), 2);
+
+        let (b, i) = moves[0];
+        let guard = st.guards[b][i].unwrap_or(Bool::TRUE);
+
+        for lane in 0..64u32 {
+            assert_eq!(
+                evaluate(&st.bools, guard, lane),
+                ((expected >> lane) & 1) != 0,
+                "incorrect EXEC bit for lane {lane}",
+            );
+        }
+
+        let (b, i) = moves[1];
+        let restored = st.guards[b][i].unwrap_or(Bool::TRUE);
+
+        for lane in 0..64u32 {
+            assert!(
+                evaluate(&st.bools, restored, lane),
+                "EXEC restoration failed for lane {lane}",
+            );
+        }
+    }
+
+    #[test]
+    fn split_exec_upper_only() {
+        check_mask(
+            &[
+                0xbe8e047e, 0xbe900380, 0xbe9103c1, 0x87fe107e, 0x7e0402ff, 0x00000063, 0xbefe040e,
+                0x7e060287, 0xbf810000,
+            ],
+            0xffffffff00000000,
+        );
+    }
+
+    #[test]
+    fn split_exec_lower_only() {
+        check_mask(
+            &[
+                0xbe8e047e, 0xbe9003c1, 0xbe910380, 0x87fe107e, 0x7e0402ff, 0x00000063, 0xbefe040e,
+                0x7e060287, 0xbf810000,
+            ],
+            0x00000000ffffffff,
+        );
+    }
+
+    #[test]
+    fn split_exec_lane_63() {
+        check_mask(
+            &[
+                0xbe8e047e, 0xbe900380, 0xbe9103ff, 0x80000000, 0x87fe107e, 0x7e0402ff, 0x00000063,
+                0xbefe040e, 0x7e060287, 0xbf810000,
+            ],
+            0x8000000000000000,
+        );
+    }
+
+    #[test]
+    fn split_exec_lane_39() {
+        check_mask(
+            &[
+                0xbe8e047e, 0xbe900380, 0xbe9103ff, 0x00000080, 0x87fe107e, 0x7e0402ff, 0x00000063,
+                0xbefe040e, 0x7e060287, 0xbf810000,
+            ],
+            0x0000008000000000,
+        );
+    }
+
+    #[test]
+    fn split_exec_lane_32() {
+        check_mask(
+            &[
+                0xbe8e047e, 0xbe900380, 0xbe910381, 0x87fe107e, 0x7e0402ff, 0x00000063, 0xbefe040e,
+                0x7e060287, 0xbf810000,
+            ],
+            0x0000000100000000,
+        );
+    }
+
+    #[test]
+    fn split_exec_sparse() {
+        check_mask(
+            &[
+                0xbe8e047e, 0xbe9003ff, 0x80000000, 0xbe9103ff, 0x80000000, 0x87fe107e, 0x7e0402ff,
+                0x00000063, 0xbefe040e, 0x7e060287, 0xbf810000,
+            ],
+            0x8000000080000000,
+        );
+    }
+
+    #[test]
+    fn split_exec_alternating() {
+        check_mask(
+            &[
+                0xbe8e047e, 0xbe9003ff, 0x55555555, 0xbe9103ff, 0xaaaaaaaa, 0x87fe107e, 0x7e0402ff,
+                0x00000063, 0xbefe040e, 0x7e060287, 0xbf810000,
+            ],
+            0xaaaaaaaa55555555,
+        );
+    }
+
+    #[test]
+    fn split_exec_all_lanes() {
+        check_mask(
+            &[
+                0xbe8e047e, 0xbe9003c1, 0xbe9103c1, 0x87fe107e, 0x7e0402ff, 0x00000063, 0xbefe040e,
+                0x7e060287, 0xbf810000,
+            ],
+            0xffffffffffffffff,
+        );
     }
 }
