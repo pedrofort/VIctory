@@ -534,9 +534,19 @@ impl Host {
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
+                        let wait = WaitForSingleObject(self.event, INFINITE);
+                        let completed = self.fence.GetCompletedValue();
+
+                        if !submission_completed(wait.0, completed, *submitted) {
+                            fail(format_args!(
+                                "host GPU completion unconfirmed: wait={:#x}, completed={}, expected={}",
+                                wait.0, completed, *submitted
+                            ));
+                        }
                     }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                    Err(e) => fail(format_args!(
+                        "host GPU submission fence failed: {e}"
+                    )),
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -1650,7 +1660,27 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let hr = p.swap_chain.Present(0, DXGI_PRESENT(0));
+
+            if hr.is_err() {
+                tracing::warn!(
+                    frame,
+                    hresult = format_args!("{:#010x}", hr.0 as u32),
+                    "AUDIT_PRESENT_FAILED"
+                );
+                return None;
+            }
+
+            if hr.0 != 0 {
+                tracing::warn!(
+                    frame,
+                    hresult = format_args!("{:#010x}", hr.0 as u32),
+                    "AUDIT_PRESENT_STATUS"
+                );
+                return None;
+            }
+
+            tracing::debug!(frame, "AUDIT_PRESENT_OK");
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -2041,5 +2071,132 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+}
+
+
+// Experimental host completion guard.
+fn submission_completed(wait: u32, completed: u64, target: u64) -> bool {
+    wait == 0
+        && completed != u64::MAX
+        && completed >= target
+}
+
+#[cfg(test)]
+mod apple_deep_audit {
+    use super::*;
+
+    #[test]
+    fn completion_rejects_false_success() {
+        assert!(submission_completed(0, 1, 1));
+        assert!(submission_completed(0, 9, 4));
+
+        // Event signalled, but the required fence is not complete.
+        assert!(!submission_completed(0, 3, 4));
+
+        // WAIT_TIMEOUT.
+        assert!(!submission_completed(0x102, 4, 4));
+
+        // WAIT_FAILED.
+        assert!(!submission_completed(u32::MAX, 4, 4));
+
+        // Device removal sentinel.
+        assert!(!submission_completed(0, u64::MAX, 4));
+
+        println!("AUDIT_COMPLETION_CONTROLS=6/6");
+    }
+
+    #[test]
+    fn report_host_capabilities() {
+        let h = host().expect("host D3D12 unavailable");
+
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+
+        let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_6,
+        };
+
+        let mesh_result = unsafe {
+            h.device.CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS7,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+        };
+
+        let model_result = unsafe {
+            h.device.CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut model).cast(),
+                size_of_val(&model) as u32,
+            )
+        };
+
+        println!(
+            "AUDIT_MESH_QUERY={:?}",
+            mesh_result
+        );
+
+        println!(
+            "AUDIT_MODEL_QUERY={:?}",
+            model_result
+        );
+
+        println!(
+            "AUDIT_MESH_TIER={}",
+            options.MeshShaderTier.0
+        );
+
+        println!(
+            "AUDIT_SHADER_MODEL={:#x}",
+            model.HighestShaderModel.0
+        );
+
+        let supported =
+            mesh_result.is_ok()
+            && model_result.is_ok()
+            && options.MeshShaderTier
+                != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
+            && model.HighestShaderModel.0
+                >= D3D_SHADER_MODEL_6_6.0;
+
+        println!(
+            "AUDIT_MESH_SUPPORTED={}",
+            supported
+        );
+
+        assert_eq!(h.mesh_shaders(), supported);
+
+        for (name, format) in [
+            ("RGBA8", DXGI_FORMAT_R8G8B8A8_UNORM),
+            ("BGRA8", DXGI_FORMAT_B8G8R8A8_UNORM),
+            ("RGBA16F", DXGI_FORMAT_R16G16B16A16_FLOAT),
+            ("BC1", DXGI_FORMAT_BC1_UNORM),
+            ("BC3", DXGI_FORMAT_BC3_UNORM),
+            ("BC5", DXGI_FORMAT_BC5_UNORM),
+            ("BC7", DXGI_FORMAT_BC7_UNORM),
+            ("D32", DXGI_FORMAT_D32_FLOAT),
+        ] {
+            let mut caps = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: format,
+                ..Default::default()
+            };
+
+            let result = unsafe {
+                h.device.CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT,
+                    (&raw mut caps).cast(),
+                    size_of_val(&caps) as u32,
+                )
+            };
+
+            println!(
+                "AUDIT_FORMAT={} query={:?} support1={:#x} support2={:#x}",
+                name,
+                result,
+                caps.Support1.0,
+                caps.Support2.0
+            );
+        }
     }
 }
